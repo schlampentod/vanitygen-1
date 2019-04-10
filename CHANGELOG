@@ -79,3 +79,36 @@ Version 0.17, released August 8, 2011:
 	- New oclvanitygen add/subtract/compare functions for AMD Radeon
 	- Add support for AMD BFI_INT instruction in oclvanitygen hash functions
 	- Minor source code reorganization
+
+Version 0.18, released July 4, 2012:
+	- Support additive base public keys for outsourced address generation.
+	- New oclvanityminer program, organized address miner for use with
+	  bounty pools, like ThePiachu's Vanity Pool.
+	- New keyconv program for converting bitcoin private keys between
+	  wallet import format, password-protected format, and PKCS#8.
+	- Support generation of simple P2SH (type-3) addresses.
+	- Mac OS X makefile merged with Linux Makefile.
+
+Version 0.19, released July 4, 2012:
+	- Fix a potentially serious crash.
+	- Remove oclvanitygen "-r" option.
+
+Version 0.20, released August 18, 2012:
+	- Support binding to multiple OpenCL devices in oclvanitygen/miner
+	- Concurrent search for bounties with the same public key in
+	  oclvanityminer
+	- Support multiple pattern input files with different case-sensitivity
+	- Fix crash with -X option in vanitygen
+	- Fix case-insensitive search for prefixes that contain invalid
+	  characters in their given case, but are valid if case-swapped
+	- Follow HTTP redirections in oclvanityminer
+
+Version 0.21, released August 21, 2012:
+	- Fix assertion failure in oclvanityminer work submission handler
+	- Fix bug in case-insensitive prefix enumerator that would skip the
+	  last possible combination.
+	- More useful error messages for OpenCL failures in oclvanitygen/miner
+
+Version 0.22, released October 11, 2012:
+	- Fix bugs in oclvanityminer bounty list parser
+	- Use GET instead of POST for work submission in oclvanityminer

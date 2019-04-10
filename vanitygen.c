@@ -16,6 +16,8 @@
  * along with Vanitygen.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#define AVX1SUPPORT
+
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
@@ -31,172 +33,23 @@
 
 #include "pattern.h"
 #include "util.h"
+#include "rmd160.h"
+#include "sha256.h"
 
-const char *version = "0.17";
+#include <immintrin.h>
+#include <string.h>
+#include <stdlib.h>
+#include <inttypes.h>
 
-typedef struct _vg_thread_context_s {
-	vg_exec_context_t		base;
-	struct _vg_thread_context_s	*vt_next;
-	int				vt_mode;
-	int				vt_stop;
-} vg_thread_context_t;
+#include "custom_ec_bn.h"
 
+const char *version = VANITYGEN_VERSION;
 
-/*
- * To synchronize pattern lists, we use a special shared-exclusive lock
- * geared toward being held in shared mode 99.9% of the time.
- */
-
-static pthread_mutex_t vg_thread_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t vg_thread_rdcond = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t vg_thread_wrcond = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t vg_thread_upcond = PTHREAD_COND_INITIALIZER;
-static vg_thread_context_t *vg_threads = NULL;
-static int vg_thread_excl = 0;
-
-void
-__vg_thread_yield(vg_thread_context_t *vtcp)
-{
-	vtcp->vt_mode = 0;
-	while (vg_thread_excl) {
-		if (vtcp->vt_stop) {
-			assert(vg_thread_excl);
-			vtcp->vt_stop = 0;
-			pthread_cond_signal(&vg_thread_upcond);
-		}
-		pthread_cond_wait(&vg_thread_rdcond, &vg_thread_lock);
-	}
-	assert(!vtcp->vt_stop);
-	assert(!vtcp->vt_mode);
-	vtcp->vt_mode = 1;
-}
-
-void
-vg_thread_context_init(vg_context_t *vcp, vg_thread_context_t *vtcp)
-{
-	vtcp->vt_mode = 0;
-	vtcp->vt_stop = 0;
-
-	pthread_mutex_lock(&vg_thread_lock);
-	vg_exec_context_init(vcp, &vtcp->base);
-	vtcp->vt_next = vg_threads;
-	vg_threads = vtcp;
-	__vg_thread_yield(vtcp);
-	pthread_mutex_unlock(&vg_thread_lock);
-}
-
-void
-vg_thread_context_del(vg_thread_context_t *vtcp)
-{
-	vg_thread_context_t *tp, **pprev;
-
-	if (vtcp->vt_mode == 2)
-		vg_exec_downgrade_lock(&vtcp->base);
-
-	pthread_mutex_lock(&vg_thread_lock);
-	assert(vtcp->vt_mode == 1);
-	vtcp->vt_mode = 0;
-
-	for (pprev = &vg_threads, tp = *pprev;
-	     (tp != vtcp) && (tp != NULL);
-	     pprev = &tp->vt_next, tp = *pprev);
-
-	assert(tp == vtcp);
-	*pprev = tp->vt_next;
-
-	if (tp->vt_stop)
-		pthread_cond_signal(&vg_thread_upcond);
-
-	vg_exec_context_del(&vtcp->base);
-	pthread_mutex_unlock(&vg_thread_lock);
-}
-
-void
-vg_thread_yield(vg_thread_context_t *vtcp)
-{
-	if (vtcp->vt_mode == 2)
-		vg_exec_downgrade_lock(&vtcp->base);
-
-	else if (vtcp->vt_stop) {
-		assert(vtcp->vt_mode == 1);
-		pthread_mutex_lock(&vg_thread_lock);
-		__vg_thread_yield(vtcp);
-		pthread_mutex_unlock(&vg_thread_lock);
-	}
-
-	assert(vtcp->vt_mode == 1);
-}
-
-
-
-void
-vg_exec_downgrade_lock(vg_exec_context_t *vxcp)
-{
-	vg_thread_context_t *vtcp = (vg_thread_context_t *) vxcp;
-	pthread_mutex_lock(&vg_thread_lock);
-
-	assert(vtcp->vt_mode == 2);
-	assert(!vtcp->vt_stop);
-	if (!--vg_thread_excl) {
-		vtcp->vt_mode = 1;
-		pthread_cond_broadcast(&vg_thread_rdcond);
-		pthread_mutex_unlock(&vg_thread_lock);
-		return;
-	}
-	pthread_cond_signal(&vg_thread_wrcond);
-	__vg_thread_yield(vtcp);
-	pthread_mutex_unlock(&vg_thread_lock);
-}
-
-int
-vg_exec_upgrade_lock(vg_exec_context_t *vxcp)
-{
-	vg_thread_context_t *vtcp = (vg_thread_context_t *) vxcp;
-	vg_thread_context_t *tp;
-
-	if (vtcp->vt_mode == 2)
-		return 0;
-
-	pthread_mutex_lock(&vg_thread_lock);
-
-	assert(vtcp->vt_mode == 1);
-	vtcp->vt_mode = 0;
-
-	if (vg_thread_excl++) {
-		assert(vtcp->vt_stop);
-		vtcp->vt_stop = 0;
-		pthread_cond_signal(&vg_thread_upcond);
-		pthread_cond_wait(&vg_thread_wrcond, &vg_thread_lock);
-
-		for (tp = vg_threads; tp != NULL; tp = tp->vt_next) {
-			assert(!tp->vt_mode);
-			assert(!tp->vt_stop);
-		}
-
-	} else {
-		for (tp = vg_threads; tp != NULL; tp = tp->vt_next) {
-			if (tp->vt_mode) {
-				assert(tp->vt_mode != 2);
-				tp->vt_stop = 1;
-			}
-		}
-
-		do {
-			for (tp = vg_threads; tp != NULL; tp = tp->vt_next) {
-				if (tp->vt_mode) {
-					assert(tp->vt_mode != 2);
-					pthread_cond_wait(&vg_thread_upcond,
-							  &vg_thread_lock);
-					break;
-				}
-			}
-		} while (tp);
-	}
-
-	vtcp->vt_mode = 2;
-	pthread_mutex_unlock(&vg_thread_lock);
-	return 1;
-}
+const enum compressiontype{
+	UNCOMPRESSED = 0,
+	COMPRESSED = 1,
+	COMBINED = 2,
+};
 
 /*
  * Address search thread main loop
@@ -205,13 +58,24 @@ vg_exec_upgrade_lock(vg_exec_context_t *vxcp)
 void *
 vg_thread_loop(void *arg)
 {
-	unsigned char eckey_buf[128];
-	unsigned char hash1[32];
+	unsigned char hash_buf[128*4]  				__attribute__((aligned(16)));
+	unsigned char hash_buf_transpose[128*4]  	__attribute__((aligned(16)));
+	// keep the size 128, in order to maintain the SHA256 512 bits per chunk
+	uint32_t *sha256lenPtr = (uint32_t *)&hash_buf;
+	unsigned char *eckey_buf;
+	unsigned char hash1[32*4] 					__attribute__((aligned(16)));
+//	unsigned char hash2[32*4] 					__attribute__((aligned(16)));
+//	unsigned char hash1_transpose[32*4] 		__attribute__((aligned(16)));
+    unsigned char hash2_transpose[32*4] 		__attribute__((aligned(16)));
 
-	int i, c, len, output_interval;
+	int i, j, c, len, output_interval;
+	int hash_len;
+	const step = 4;
 
 	const BN_ULONG rekey_max = 10000000;
 	BN_ULONG npoints, rekey_at, nbatch;
+//	BIGNUM *X,*Y,*Z;
+//	_sidm_bn_context_t temp;
 
 	vg_context_t *vcp = (vg_context_t *) arg;
 	EC_KEY *pkey = NULL;
@@ -222,16 +86,26 @@ vg_thread_loop(void *arg)
 	EC_POINT *pbatchinc;
 
 	vg_test_func_t test_func = vcp->vc_test;
-	vg_thread_context_t ctx;
+	vg_exec_context_t ctx;
 	vg_exec_context_t *vxcp;
 
 	struct timeval tvstart;
 
+	uint32_t         MDbuf[8 * 4]  __attribute__((aligned(16)));
+	uint32_t         MDbuf_transpose[8 * 4]  __attribute__((aligned(16)));
+    unsigned char    *MDBufChar = (unsigned char*) MDbuf;
 
-	memset(&ctx, 0, sizeof(ctx));
-	vxcp = &ctx.base;
+	memset(&ctx,                0, sizeof(ctx));
+//	MM_clear_mem(&hash_buf, 32*4);
+//	MM_clear_mem(&hash_buf_transpose, 32*4);
 
-	vg_thread_context_init(vcp, &ctx);
+	memset(&hash_buf,           0, 4*128);
+	memset(&hash_buf_transpose, 0, 4*128);
+	memset(&hash2_transpose,    0 ,4*32); // if this dummy is not here and init to zero. a segmentation fault occurs.
+
+	vxcp = &ctx;
+
+	vg_exec_context_init(vcp, &ctx);
 
 	pkey = vxcp->vxc_key;
 	pgroup = EC_KEY_get0_group(pkey);
@@ -240,15 +114,16 @@ vg_thread_loop(void *arg)
 	for (i = 0; i < ptarraysize; i++) {
 		ppnt[i] = EC_POINT_new(pgroup);
 		if (!ppnt[i]) {
-			printf("ERROR: out of memory?\n");
+			fprintf(stderr, "ERROR: out of memory?\n");
 			exit(1);
 		}
 	}
 	pbatchinc = EC_POINT_new(pgroup);
 	if (!pbatchinc) {
-		printf("ERROR: out of memory?\n");
+		fprintf(stderr, "ERROR: out of memory?\n");
 		exit(1);
 	}
+
 
 	BN_set_word(&vxcp->vxc_bntmp, ptarraysize);
 	EC_POINT_mul(pgroup, pbatchinc, &vxcp->vxc_bntmp, NULL, NULL,
@@ -264,9 +139,39 @@ vg_thread_loop(void *arg)
 	output_interval = 1000;
 	gettimeofday(&tvstart, NULL);
 
-	while (1) {
+	if (vcp->vc_format == VCF_SCRIPT) {
+		//hash_len = (vcp->vc_compressed)?37:69;
+		hash_len = 69;
+		for (j=0;j<4;j++){
+			hash_buf[ 0+j*128] = 0x51;  // OP_1
+			hash_buf[ 1+j*128] = 0x41;  // pubkey length
+			// gap for pubkey
+			hash_buf[(hash_len-2)+j*128] = 0x51;  // OP_1
+			hash_buf[(hash_len-1)+j*128] = 0xae;  // OP_CHECKMULTISIG
+		}
+		eckey_buf = hash_buf + 2;
+		hash_len = 69;
+
+	} else {
+		eckey_buf = hash_buf;
+		switch(vcp->vc_compressed){
+			case UNCOMPRESSED:
+				hash_len = 65;
+				break;
+			case COMPRESSED:
+				hash_len = 33;
+				break;
+			case COMBINED:
+				hash_len = 65;
+				vxcp->vc_combined_compressed = 0; // starting uncompressed
+				break;
+		}
+//		hash_len = (vcp->vc_compressed)?33:65;
+	}
+
+	while (!vcp->vc_halt) {
 		if (++npoints >= rekey_at) {
-			pthread_mutex_lock(&vg_thread_lock);
+			vg_exec_context_upgrade_lock(vxcp);
 			/* Generate a new random private key */
 			EC_KEY_generate_key(pkey);
 			npoints = 0;
@@ -275,47 +180,57 @@ vg_thread_loop(void *arg)
 			EC_GROUP_get_order(pgroup, &vxcp->vxc_bntmp,
 					   vxcp->vxc_bnctx);
 			BN_sub(&vxcp->vxc_bntmp2,
-			       &vxcp->vxc_bntmp,
-			       EC_KEY_get0_private_key(pkey));
+				   &vxcp->vxc_bntmp,
+				   EC_KEY_get0_private_key(pkey));
 			rekey_at = BN_get_word(&vxcp->vxc_bntmp2);
 			if ((rekey_at == BN_MASK2) || (rekey_at > rekey_max))
 				rekey_at = rekey_max;
 			assert(rekey_at > 0);
 
 			EC_POINT_copy(ppnt[0], EC_KEY_get0_public_key(pkey));
-			pthread_mutex_unlock(&vg_thread_lock);
+
+			vg_exec_context_downgrade_lock(vxcp);
 
 			npoints++;
 			vxcp->vxc_delta = 0;
 
-			for (nbatch = 1;
-			     (nbatch < ptarraysize) && (npoints < rekey_at);
-			     nbatch++, npoints++) {
+			if (vcp->vc_pubkey_base)
 				EC_POINT_add(pgroup,
-					     ppnt[nbatch],
-					     ppnt[nbatch-1],
-					     pgen, vxcp->vxc_bnctx);
-			}
+						 ppnt[0],
+						 ppnt[0],
+						 vcp->vc_pubkey_base,
+						 vxcp->vxc_bnctx);
 
-		} else {
-			/*
-			 * Common case
-			 *
-			 * EC_POINT_add() can skip a few multiplies if
-			 * one or both inputs are affine (Z_is_one).
-			 * This is the case for every point in ppnt, as
-			 * well as pbatchinc.
-			 */
-			assert(nbatch == ptarraysize);
-			for (nbatch = 0;
-			     (nbatch < ptarraysize) && (npoints < rekey_at);
-			     nbatch++, npoints++) {
+			for (nbatch = 1;
+				 (nbatch < ptarraysize) && (npoints < rekey_at);
+  				 nbatch++, npoints++) {
 				EC_POINT_add(pgroup,
-					     ppnt[nbatch],
-					     ppnt[nbatch],
-					     pbatchinc,
-					     vxcp->vxc_bnctx);
+						 ppnt[nbatch],
+						 ppnt[nbatch-1],
+						 pgen, vxcp->vxc_bnctx);
 			}
+		} else {
+				/*
+				 * Common case
+				 *
+				 * EC_POINT_add() can skip a few multiplies if
+				 * one or both inputs are affine (Z_is_one).
+				 * This is the case for every point in ppnt, as
+				 * well as pbatchinc.
+				 */
+
+#if 0
+				assert(nbatch == ptarraysize);
+#endif
+				for (nbatch = 0;
+					 (nbatch < ptarraysize) && (npoints < rekey_at);
+					 nbatch++, npoints++) {
+					EC_POINT_add(pgroup,
+							 ppnt[nbatch],
+							 ppnt[nbatch],
+							 pbatchinc,
+							 vxcp->vxc_bnctx);
+				}
 		}
 
 		/*
@@ -328,31 +243,156 @@ vg_thread_loop(void *arg)
 		 * To take advantage of this, we batch up a few points,
 		 * and feed them to EC_POINTs_make_affine() below.
 		 */
-
 		EC_POINTs_make_affine(pgroup, nbatch, ppnt, vxcp->vxc_bnctx);
 
-		for (i = 0; i < nbatch; i++, vxcp->vxc_delta++) {
-			/* Hash the public key */
-			len = EC_POINT_point2oct(pgroup, ppnt[i],
-						 POINT_CONVERSION_UNCOMPRESSED,
-						 eckey_buf,
-						 sizeof(eckey_buf),
-						 vxcp->vxc_bnctx);
+		if (vcp->vc_compressed == COMBINED)
+			nbatch = nbatch * 2;
 
-			SHA256(eckey_buf, len, hash1);
-			RIPEMD160(hash1, sizeof(hash1), &vxcp->vxc_binres[1]);
-
-			switch (test_func(vxcp)) {
-			case 1:
-				npoints = 0;
-				rekey_at = 0;
-				i = nbatch;
-				break;
-			case 2:
-				goto out;
-			default:
-				break;
+		for (i = 0; i < nbatch; i=i+step) {
+			if (i==nbatch/2 && vcp->vc_compressed == COMBINED){
+				vxcp->vxc_delta = vxcp->vxc_delta - i;
+				memset(&hash_buf, 0, 512);
 			}
+			for (j=0; j< step;j++){
+				switch (vcp->vc_compressed){
+					case UNCOMPRESSED:
+							/* Hash the public key */
+							// BN_bn2bin()
+							// this function does perform a affine check/modify that cannot be bypassed, it is rewritten to
+							// a simpler form., just get the jacobian X and Y, since the group-affine put Z equal 1.
+							// convert the BigNum to octal stream.
+							// Compressed is determined by Y, compressed 02->Y=even 03->Y=odd; 04->uncompressed
+							len = struct_EC_POINT_point2oct(pgroup, ppnt[i+j],
+			//    			len = EC_POINT_point2oct(pgroup, ppnt[i+j],
+										 POINT_CONVERSION_UNCOMPRESSED,
+										 eckey_buf+(j*128),
+										 65,
+										 vxcp->vxc_bnctx);
+
+							vxcp->vxc_delta++;
+						hash_len = 65;
+						break;
+					case COMPRESSED:
+							len = struct_EC_POINT_point2oct(pgroup, ppnt[i+j],
+										 POINT_CONVERSION_COMPRESSED,
+										 eckey_buf+(j*128),
+										 33,
+										 vxcp->vxc_bnctx);
+
+							vxcp->vxc_delta++;
+						hash_len = 33;
+						break;
+					case COMBINED:
+						if (i < ptarraysize){
+							len = struct_EC_POINT_point2oct(pgroup, ppnt[i+j],
+										 POINT_CONVERSION_UNCOMPRESSED,
+										 eckey_buf+(j*128),
+										 65,
+										 vxcp->vxc_bnctx);
+							vxcp->vxc_delta++;
+							vxcp->vc_combined_compressed = 0;
+							hash_len = 65;
+						}else{
+							len = struct_EC_POINT_point2oct(pgroup, ppnt[(i-ptarraysize)+j],
+										 POINT_CONVERSION_COMPRESSED,
+										 eckey_buf+(j*128),
+										 33,
+										 vxcp->vxc_bnctx);
+
+							vxcp->vc_combined_compressed = 1;
+							vxcp->vxc_delta++;
+							hash_len = 33;
+						}
+						break;
+					}
+				}
+
+#ifndef AVX1SUPPORT
+			for (j=0; j< step;j++){
+				SHA256(hash_buf+(j*128), hash_len, hash1+(j*32));
+			}
+#else
+			for (j=0; j< step;j++){
+				// hash_len is 65 or 69 length, so for SHA256 always two chunks
+				// so the SHA prepare is here; add "1" and length are inserted in the buffer
+				if (vxcp->vc_combined_compressed){
+					// compressed hash-len is 33 only one chunk.
+					hash_buf[hash_len+(j*128)]= 0x80;
+					sha256lenPtr[14+j*32] = (hash_len >> 29);
+					sha256lenPtr[15+j*32] =	hash_len << 3;
+				}else{
+					hash_buf[hash_len+(j*128)]= 0x80;
+					sha256lenPtr[30+j*32] = (hash_len >> 29);
+					sha256lenPtr[31+j*32] =	hash_len << 3;
+				}
+			}
+			// transpose the hash_buf from row to column
+			MM_matrix_transpose_r2c((__m128i*)hash_buf,(__m128i*)hash_buf_transpose, 4, 32);
+			// Big/small endian recoding
+			// don't use 32, the last two positions hold the length, already formatted correctly.
+			// since the buffer also contains 0's minimal = 18 (69/4)+1, big endians of 0 are still 0
+			if (vxcp->vc_combined_compressed)
+				MM_beRecode((__m128i*)hash_buf_transpose,14);
+			else
+				MM_beRecode((__m128i*)hash_buf_transpose,30);
+			// init the hash
+			MM_sha256_init((uint32_t*)hash1);
+			// run transform first chunk
+			MM_sha256_transform((__m128i*)hash1, (__m128i*)hash_buf_transpose);
+			// run transform 2nd chunk
+			if (!(vxcp->vc_combined_compressed))
+					MM_sha256_transform((__m128i*)hash1, (__m128i*)(hash_buf_transpose+256));
+			// Big/small endian recoding
+			MM_beRecode((__m128i*)hash1,16);
+
+#endif
+			if (step==1){
+				MDinit(MDbuf);
+				MDfinish(MDbuf, hash1, sizeof(hash1)/4, 0);
+			}else{
+#ifndef AVX1SUPPORT
+				MDinit(MDbuf);
+				MDfinish(MDbuf, hash1, sizeof(hash1)/4, 0);
+				MDinit(MDbuf+8);
+				MDfinish(MDbuf+8, hash1+32, sizeof(hash1)/4, 0);
+				MDinit(MDbuf+16);
+				MDfinish(MDbuf+16, hash1+64, sizeof(hash1)/4, 0);
+				MDinit(MDbuf+24);
+				MDfinish(MDbuf+24, hash1+96, sizeof(hash1)/4, 0);
+#else
+//				MD_matrix_transpose_r2c(hash1,hash1_transpose, 4, 8);
+				MM_MDinit(MDbuf_transpose);
+//				_mm_MDfinish(MDbuf_transpose, hash1_transpose /*hash1*/, sizeof(hash1)/4, 0);
+				MM_MDfinish((__m128i*)MDbuf_transpose, (__m128i*)hash1 /*hash1_transpose*/, sizeof(hash1)/4, 0);
+				MM_matrix_transpose_c2r((__m128i*)MDbuf_transpose, (__m128i*)MDbuf, 8, 4);
+				//from this point the 4 byte checksum could be calculated.
+				// sha256 the MDBuf, add a byte of 0 to the front (making the length 160/8 +1 = 21 bytes
+				// sha256 this result and take the 4 first bytes as the checksum result.
+				// when the search is not regex, these steps could be skipped, these LSB will not influence
+				// the vanity bitcoin address at the first ~10-15 characters
+
+				// base58 the result, a zero is added to the result for Bitcoin addresses
+				// the source can be treated as a base-256 or base-65536 (reduces the number of steps) and run on SSE/AVX
+#endif
+			}
+			vxcp->vxc_delta=vxcp->vxc_delta-step;
+		    for (j=0;j<step;j++){
+	    		memcpy(vxcp->vxc_binres+1,MDBufChar+j*32,20);
+	    		switch (test_func(vxcp)) {
+					case 1:
+//						npoints = 0;
+//						rekey_at = 0;
+//						i = nbatch;
+//						j = step;
+						break;
+					case 2:
+//						break;
+						goto out;
+					default:
+						break;
+				}
+	    		vxcp->vxc_delta++;
+		    }
 		}
 
 		c += i;
@@ -363,11 +403,14 @@ vg_thread_loop(void *arg)
 			c = 0;
 		}
 
-		vg_thread_yield(&ctx);
+		vg_exec_context_yield(vxcp);
 	}
 
 out:
-	vg_thread_context_del(&ctx);
+
+	vg_exec_context_del(&ctx);
+	vg_context_thread_exit(vcp);
+
 
 	for (i = 0; i < ptarraysize; i++)
 		if (ppnt[i])
@@ -408,13 +451,14 @@ start_threads(vg_context_t *vcp, int nthreads)
 		/* Determine the number of threads */
 		nthreads = count_processors();
 		if (nthreads <= 0) {
-			printf("ERROR: could not determine processor count\n");
+			fprintf(stderr,
+				"ERROR: could not determine processor count\n");
 			nthreads = 1;
 		}
 	}
 
 	if (vcp->vc_verbose > 1) {
-		printf("Using %d worker thread(s)\n", nthreads);
+		fprintf(stderr, "Using %d worker thread(s)\n", nthreads);
 	}
 
 	while (--nthreads) {
@@ -430,9 +474,9 @@ start_threads(vg_context_t *vcp, int nthreads)
 void
 usage(const char *name)
 {
-	printf(
+	fprintf(stderr,
 "Vanitygen %s (" OPENSSL_VERSION_TEXT ")\n"
-"Usage: %s [-vqrikNT] [-t <threads>] [-f <filename>|-] [<pattern>...]\n"
+"Usage: %s [-vqnrik1NT] [-t <threads>] [-f <filename>|-] [<pattern>...]\n"
 "Generates a bitcoin receiving address matching <pattern>, and outputs the\n"
 "address and associated private key.  The private key may be stored in a safe\n"
 "location or imported into a bitcoin client to spend any balance received on\n"
@@ -442,13 +486,19 @@ usage(const char *name)
 "Options:\n"
 "-v            Verbose output\n"
 "-q            Quiet output\n"
+"-n            Simulate\n"
 "-r            Use regular expression match instead of prefix\n"
 "              (Feasibility of expression is not checked)\n"
 "-i            Case-insensitive prefix search\n"
 "-k            Keep pattern and continue search after finding a match\n"
+"-1            Stop after first match\n"
+"-L            Generate litecoin address\n"
 "-N            Generate namecoin address\n"
 "-T            Generate bitcoin testnet address\n"
 "-X <version>  Generate address with the given version\n"
+"-p <privtyp>  The priv-type belonging to the version, default <version>+128\n"
+"-F <format>   Generate address with the given format (pubkey, compressed, combined, script)\n"
+"-P <pubkey>   Specify base public key for piecewise key generation\n"
 "-e            Encrypt private keys, prompt for password\n"
 "-E <password> Encrypt private keys with <password> (UNSAFE)\n"
 "-t <threads>  Set number of worker threads (Default: number of CPUs)\n"
@@ -459,19 +509,25 @@ usage(const char *name)
 version, name);
 }
 
+#define MAX_FILE 4
+
 int
 main(int argc, char **argv)
 {
 	int addrtype = 0;
+	int scriptaddrtype = 5;
 	int privtype = 128;
+	int pubkeytype;
+	enum vg_format format = VCF_PUBKEY;
 	int regex = 0;
 	int caseinsensitive = 0;
 	int verbose = 1;
+	int simulate = 0;
 	int remove_on_match = 1;
+	int only_one = 0;
 	int prompt_password = 0;
 	int opt;
 	char *seedfile = NULL;
-	FILE *fp = NULL;
 	char pwbuf[128];
 	const char *result_file = NULL;
 	const char *key_password = NULL;
@@ -479,14 +535,29 @@ main(int argc, char **argv)
 	int npatterns = 0;
 	int nthreads = 0;
 	vg_context_t *vcp = NULL;
+	EC_POINT *pubkey_base = NULL;
 
-	while ((opt = getopt(argc, argv, "vqrikeE:NTX:t:h?f:o:s:")) != -1) {
+	FILE *pattfp[MAX_FILE], *fp;
+	int pattfpi[MAX_FILE];
+	int npattfp = 0;
+	int pattstdin = 0;
+	int compressed = 0; // make use of this switch to combine compresses with uncompressed
+	int newprivtype, privtypeoverride = 0;
+	int i;
+
+	while ((opt = getopt(argc, argv, "Lvqnrik1eE:P:NTX:F:t:h?f:o:s:p:")) != -1) {
 		switch (opt) {
+		case 'c':
+		        compressed = 1;
+		        break;
 		case 'v':
 			verbose = 2;
 			break;
 		case 'q':
 			verbose = 0;
+			break;
+		case 'n':
+			simulate = 1;
 			break;
 		case 'r':
 			regex = 1;
@@ -497,18 +568,67 @@ main(int argc, char **argv)
 		case 'k':
 			remove_on_match = 0;
 			break;
+		case '1':
+			only_one = 1;
+			break;
 		case 'N':
 			addrtype = 52;
 			privtype = 180;
+			scriptaddrtype = -1;
+			break;
+		case 'L':
+			addrtype = 48;
+			privtype = 176;
+			scriptaddrtype = -1;
 			break;
 		case 'T':
 			addrtype = 111;
 			privtype = 239;
+			scriptaddrtype = 196;
 			break;
 		case 'X':
 			addrtype = atoi(optarg);
 			privtype = 128 + addrtype;
+			scriptaddrtype = addrtype;
 			break;
+		case 'p':
+			newprivtype = atoi(optarg);
+			privtypeoverride = 1;
+			break;
+		case 'F':
+			if (!strcmp(optarg, "script"))
+				format = VCF_SCRIPT;
+            else
+              if (!strcmp(optarg, "compressed"))
+                 compressed = 1;
+              else
+            	  if (!strcmp(optarg, "combined"))
+            		  compressed = 2;
+            	  else
+            		  if (strcmp(optarg, "pubkey")) {
+            			  fprintf(stderr,  "Invalid format '%s'\n", optarg);
+            			  return 1;
+            		  }
+			break;
+		case 'P': {
+			if (pubkey_base != NULL) {
+				fprintf(stderr,
+					"Multiple base pubkeys specified\n");
+				return 1;
+			}
+			EC_KEY *pkey = vg_exec_context_new_key();
+			pubkey_base = EC_POINT_hex2point(
+				EC_KEY_get0_group(pkey),
+				optarg, NULL, NULL);
+			EC_KEY_free(pkey);
+			if (pubkey_base == NULL) {
+				fprintf(stderr,
+					"Invalid base pubkey\n");
+				return 1;
+			}
+			break;
+		}
+			
 		case 'e':
 			prompt_password = 1;
 			break;
@@ -518,36 +638,49 @@ main(int argc, char **argv)
 		case 't':
 			nthreads = atoi(optarg);
 			if (nthreads == 0) {
-				printf("Invalid thread count '%s'\n", optarg);
+				fprintf(stderr,
+					"Invalid thread count '%s'\n", optarg);
 				return 1;
 			}
 			break;
 		case 'f':
-			if (fp) {
-				printf("Multiple files specified\n");
+			if (npattfp >= MAX_FILE) {
+				fprintf(stderr,
+					"Too many input files specified\n");
 				return 1;
 			}
 			if (!strcmp(optarg, "-")) {
+				if (pattstdin) {
+					fprintf(stderr, "ERROR: stdin "
+						"specified multiple times\n");
+					return 1;
+				}
 				fp = stdin;
 			} else {
 				fp = fopen(optarg, "r");
 				if (!fp) {
-					printf("Could not open %s: %s\n",
-					       optarg, strerror(errno));
+					fprintf(stderr,
+						"Could not open %s: %s\n",
+						optarg, strerror(errno));
 					return 1;
 				}
 			}
+			pattfp[npattfp] = fp;
+			pattfpi[npattfp] = caseinsensitive;
+			npattfp++;
 			break;
 		case 'o':
 			if (result_file) {
-				printf("Multiple output files specified\n");
+				fprintf(stderr,
+					"Multiple output files specified\n");
 				return 1;
 			}
 			result_file = optarg;
 			break;
 		case 's':
 			if (seedfile != NULL) {
-				printf("Multiple RNG seeds specified\n");
+				fprintf(stderr,
+					"Multiple RNG seeds specified\n");
 				return 1;
 			}
 			seedfile = optarg;
@@ -557,18 +690,35 @@ main(int argc, char **argv)
 			return 1;
 		}
 	}
+	if (privtypeoverride==1){
+		privtype= newprivtype;
+	}
 
 #if OPENSSL_VERSION_NUMBER < 0x10000000L
 	/* Complain about older versions of OpenSSL */
 	if (verbose > 0) {
-		printf("WARNING: Built with " OPENSSL_VERSION_TEXT "\n"
-		       "WARNING: Use OpenSSL 1.0.0d+ for best performance\n");
+		fprintf(stderr,
+			"WARNING: Built with " OPENSSL_VERSION_TEXT "\n"
+			"WARNING: Use OpenSSL 1.0.0d+ for best performance\n");
 	}
 #endif
 
 	if (caseinsensitive && regex)
-		printf("WARNING: case insensitive mode incompatible with "
-		       "regular expressions\n");
+		fprintf(stderr,
+			"WARNING: case insensitive mode incompatible with "
+			"regular expressions\n");
+
+	pubkeytype = addrtype;
+	if (format == VCF_SCRIPT)
+	{
+		if (scriptaddrtype == -1)
+		{
+			fprintf(stderr,
+				"Address type incompatible with script format\n");
+			return 1;
+		}
+		addrtype = scriptaddrtype;
+	}
 
 	if (seedfile) {
 		opt = -1;
@@ -581,31 +731,15 @@ main(int argc, char **argv)
 #endif
 		opt = RAND_load_file(seedfile, opt);
 		if (!opt) {
-			printf("Could not load RNG seed %s\n", optarg);
+			fprintf(stderr, "Could not load RNG seed %s\n", optarg);
 			return 1;
 		}
 		if (verbose > 0) {
-			printf("Read %d bytes from RNG seed file\n", opt);
+			fprintf(stderr,
+				"Read %d bytes from RNG seed file\n", opt);
 		}
 	}
 
-	if (fp) {
-		if (!vg_read_file(fp, &patterns, &npatterns)) {
-			printf("Failed to load pattern file\n");
-			return 1;
-		}
-		if (fp != stdin)
-			fclose(fp);
-
-	} else {
-		if (optind >= argc) {
-			usage(argv[0]);
-			return 1;
-		}
-		patterns = &argv[optind];
-		npatterns = argc - optind;
-	}
-		
 	if (regex) {
 		vcp = vg_regex_context_new(addrtype, privtype);
 
@@ -614,15 +748,53 @@ main(int argc, char **argv)
 					    caseinsensitive);
 	}
 
+	vcp->vc_compressed = compressed;
 	vcp->vc_verbose = verbose;
 	vcp->vc_result_file = result_file;
 	vcp->vc_remove_on_match = remove_on_match;
+	vcp->vc_only_one = only_one;
+	vcp->vc_format = format;
+	vcp->vc_pubkeytype = pubkeytype;
+	vcp->vc_pubkey_base = pubkey_base;
 
-	if (!vg_context_add_patterns(vcp, patterns, npatterns))
+	vcp->vc_output_match = vg_output_match_console;
+	vcp->vc_output_timing = vg_output_timing_console;
+
+	if (!npattfp) {
+		if (optind >= argc) {
+			usage(argv[0]);
+			return 1;
+		}
+		patterns = &argv[optind];
+
+		npatterns = argc - optind;
+
+		if (!vg_context_add_patterns(vcp,
+					     (const char ** const) patterns,
+					     npatterns))
 		return 1;
+	}
+
+	for (i = 0; i < npattfp; i++) {
+		fp = pattfp[i];
+		if (!vg_read_file(fp, &patterns, &npatterns)) {
+			fprintf(stderr, "Failed to load pattern file\n");
+			return 1;
+		}
+		if (fp != stdin)
+			fclose(fp);
+
+		if (!regex)
+			vg_prefix_context_set_case_insensitive(vcp, pattfpi[i]);
+
+		if (!vg_context_add_patterns(vcp,
+					     (const char ** const) patterns,
+					     npatterns))
+		return 1;
+	}
 
 	if (!vcp->vc_npatterns) {
-		printf("No patterns to search\n");
+		fprintf(stderr, "No patterns to search\n");
 		return 1;
 	}
 
@@ -634,12 +806,17 @@ main(int argc, char **argv)
 	vcp->vc_key_protect_pass = key_password;
 	if (key_password) {
 		if (!vg_check_password_complexity(key_password, verbose))
-			printf("WARNING: Protecting private keys with "
-			       "weak password\n");
+			fprintf(stderr,
+				"WARNING: Protecting private keys with "
+				"weak password\n");
 	}
 
 	if ((verbose > 0) && regex && (vcp->vc_npatterns > 1))
-		printf("Regular expressions: %ld\n", vcp->vc_npatterns);
+		fprintf(stderr,
+			"Regular expressions: %ld\n", vcp->vc_npatterns);
+
+	if (simulate)
+		return 0;
 
 	if (!start_threads(vcp, nthreads))
 		return 1;

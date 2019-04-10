@@ -22,9 +22,10 @@
 #include <windows.h>
 #include <tchar.h>
 #include <time.h>
+#include <pthread.h>
 
 #define INLINE
-#define snprintf _snprintf
+//#define snprintf _snprintf
 
 struct timezone;
 
@@ -42,5 +43,11 @@ extern int getopt(int argc, TCHAR *argv[], TCHAR *optstring);
 extern int count_processors(void);
 
 #define PRSIZET "I"
+
+//extern inline char * strtok_r
+//static inline char *
+//strtok_r(char *strToken, const char *strDelimit, char **context) {
+//	return strtok_s(strToken, strDelimit, context);
+//}
 
 #endif /* !defined (__VG_WINGLUE_H__) */

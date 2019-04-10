@@ -16,6 +16,10 @@
  * along with Vanitygen.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#if defined(_WIN32)
+#define _USE_MATH_DEFINES
+#endif /* defined(_WIN32) */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +32,9 @@
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/pkcs12.h>
 
 #include "pattern.h"
 #include "util.h"
@@ -53,23 +60,39 @@ const signed char vg_b58_reverse_map[256] = {
 };
 
 void
-dumphex(const unsigned char *src, size_t len)
+fdumphex(FILE *fp, const unsigned char *src, size_t len)
 {
 	size_t i;
 	for (i = 0; i < len; i++) {
-		printf("%02x", src[i]);
+		fprintf(fp, "%02x", src[i]);
 	}
 	printf("\n");
 }
 
 void
-dumpbn(const BIGNUM *bn)
+fdumpbn(FILE *fp, const BIGNUM *bn)
 {
 	char *buf;
 	buf = BN_bn2hex(bn);
-	printf("%s\n", buf ? buf : "0");
+	fprintf(fp, "%s\n", buf ? buf : "0");
 	if (buf)
 		OPENSSL_free(buf);
+}
+
+void
+dumphex(const unsigned char *src, size_t len)
+{
+	fdumphex(stdout, src, len);
+}
+
+void
+dumpbn(const BIGNUM *bn)
+{
+/*	for (int i=0;i<bn->top; i++) {
+		BN_ULONG l = bn->d[i];
+		printf("%x %x ", (int)(l), (int)(l>>32));
+	}*/
+	fdumpbn(stdout, bn);
 }
 
 /*
@@ -137,6 +160,9 @@ vg_b58_encode_check(void *buf, size_t len, char *result)
 	BN_CTX_free(bnctx);
 }
 
+#define skip_char(c) \
+	(((c) == '\r') || ((c) == '\n') || ((c) == ' ') || ((c) == '\t'))
+
 int
 vg_b58_decode_check(const char *input, void *buf, size_t len)
 {
@@ -157,6 +183,8 @@ vg_b58_decode_check(const char *input, void *buf, size_t len)
 	/* Build a bignum from the encoded value */
 	l = strlen(input);
 	for (i = 0; i < l; i++) {
+		if (skip_char(input[i]))
+			continue;
 		c = vg_b58_reverse_map[(int)input[i]];
 		if (c < 0)
 			goto out;
@@ -167,13 +195,19 @@ vg_b58_decode_check(const char *input, void *buf, size_t len)
 	}
 
 	/* Copy the bignum to a byte buffer */
-	for (zpfx = 0;
-	     input[zpfx] && (input[zpfx] == vg_b58_alphabet[0]);
-	     zpfx++);
+	for (i = 0, zpfx = 0; input[i]; i++) {
+		if (skip_char(input[i]))
+			continue;
+		if (input[i] != vg_b58_alphabet[0])
+			break;
+		zpfx++;
+	}
 	c = BN_num_bytes(&bn);
 	l = zpfx + c;
-	if (l < 5)
+	if (l < 5) {
+		printf("%d + %d < 5\n", zpfx, c);
 		goto out;
+	}
 	xbuf = (unsigned char *) malloc(l);
 	if (!xbuf)
 		goto out;
@@ -208,7 +242,8 @@ out:
 }
 
 void
-vg_encode_address(const EC_KEY *pkey, int addrtype, char *result)
+vg_encode_address(const EC_POINT *ppoint, const EC_GROUP *pgroup,
+		  int addrtype, char *result)
 {
 	unsigned char eckey_buf[128], *pend;
 	unsigned char binres[21] = {0,};
@@ -216,10 +251,86 @@ vg_encode_address(const EC_KEY *pkey, int addrtype, char *result)
 
 	pend = eckey_buf;
 
-	i2o_ECPublicKey((EC_KEY*)pkey, &pend);
-
+	EC_POINT_point2oct(pgroup,
+			   ppoint,
+			   POINT_CONVERSION_UNCOMPRESSED,
+			   eckey_buf,
+			   sizeof(eckey_buf),
+			   NULL);
+	
+#ifdef TRACE
+	printf("pre-hash: ");
+	for (int i=0;i<64; i++) printf("%02x ", eckey_buf[i]);
+	printf("\n");
+#endif
+		
+	pend = eckey_buf + 0x41;
 	binres[0] = addrtype;
 	SHA256(eckey_buf, pend - eckey_buf, hash1);
+	RIPEMD160(hash1, sizeof(hash1), &binres[1]);
+
+#ifdef TRACE
+	printf("Hash: ");
+	for (int i=0;i<20; i++) printf("%02x ", binres[i+1]);
+	printf("\n");
+#endif
+	vg_b58_encode_check(binres, sizeof(binres), result);
+}
+
+void
+vg_encode_address_compressed(const EC_POINT *ppoint, const EC_GROUP *pgroup,
+		  int addrtype, char *result)
+{
+	unsigned char eckey_buf[128], *pend;
+	unsigned char binres[21] = {0,};
+	unsigned char hash1[32];
+
+	pend = eckey_buf;
+
+	EC_POINT_point2oct(pgroup,
+			   ppoint,
+			   POINT_CONVERSION_COMPRESSED,
+			   eckey_buf,
+			   sizeof(eckey_buf),
+			   NULL);
+#ifdef TRACE
+	printf("Point compressed:\n");
+	for (int i=0; i<0x21; i++) {
+		printf("%02x ", eckey_buf[i]);
+	}
+	printf("\n");
+#endif
+	pend = eckey_buf + 0x21;
+	binres[0] = addrtype;
+	SHA256(eckey_buf, pend - eckey_buf, hash1);
+	RIPEMD160(hash1, sizeof(hash1), &binres[1]);
+
+	vg_b58_encode_check(binres, sizeof(binres), result);
+}
+
+void
+vg_encode_script_address(const EC_POINT *ppoint, const EC_GROUP *pgroup,
+			 int addrtype, char *result)
+{
+	unsigned char script_buf[69];
+	unsigned char *eckey_buf = script_buf + 2;
+	unsigned char binres[21] = {0,};
+	unsigned char hash1[32];
+
+	script_buf[ 0] = 0x51;  // OP_1
+	script_buf[ 1] = 0x41;  // pubkey length
+	// gap for pubkey
+	script_buf[67] = 0x51;  // OP_1
+	script_buf[68] = 0xae;  // OP_CHECKMULTISIG
+
+	EC_POINT_point2oct(pgroup,
+			   ppoint,
+			   POINT_CONVERSION_UNCOMPRESSED,
+			   eckey_buf,
+			   65,
+			   NULL);
+	binres[0] = addrtype;
+	SHA256(script_buf, 69, hash1);
 	RIPEMD160(hash1, sizeof(hash1), &binres[1]);
 
 	vg_b58_encode_check(binres, sizeof(binres), result);
@@ -244,9 +355,30 @@ vg_encode_privkey(const EC_KEY *pkey, int addrtype, char *result)
 	vg_b58_encode_check(eckey_buf, 33, result);
 }
 
+void
+vg_encode_privkey_compressed(const EC_KEY *pkey, int addrtype, char *result)
+{
+	unsigned char eckey_buf[128];
+	const BIGNUM *bn;
+	int nbytes;
+
+	bn = EC_KEY_get0_private_key(pkey);
+
+	eckey_buf[0] = addrtype;
+	nbytes = BN_num_bytes(bn);
+	assert(nbytes <= 32);
+	if (nbytes < 32)
+		memset(eckey_buf + 1, 0, 32 - nbytes);
+	BN_bn2bin(bn, &eckey_buf[33 - nbytes]);
+	eckey_buf[nbytes+1] = 1;
+
+	vg_b58_encode_check(eckey_buf, 34, result);
+}
+
 int
 vg_set_privkey(const BIGNUM *bnpriv, EC_KEY *pkey)
 {
+	//printf("vg_set_privkey %lx\n", bnpriv->d[0]);
 	const EC_GROUP *pgroup;
 	EC_POINT *ppnt;
 	int res;
@@ -277,72 +409,357 @@ vg_decode_privkey(const char *b58encoded, EC_KEY *pkey, int *addrtype)
 	int res;
 
 	res = vg_b58_decode_check(b58encoded, ecpriv, sizeof(ecpriv));
+	if (res != 33) {
+		//fprintf(stderr, "len=%d != 33\n", res);
+		return 0;
+	}
 
 	BN_init(&bnpriv);
 	BN_bin2bn(ecpriv + 1, res - 1, &bnpriv);
 	res = vg_set_privkey(&bnpriv, pkey);
 	BN_clear_free(&bnpriv);
-
-	if (res)
-		*addrtype = ecpriv[0];
-	return res;
+	*addrtype = ecpriv[0];
+	return 1;
 }
 
-#define VG_PROTKEY_SALT_SIZE 4
-#define VG_PROTKEY_HMAC_SIZE 8
-#define VG_PROTKEY_HMAC_KEY_SIZE 16
+int
+vg_decode_privkey_compressed(const char *b58encoded, EC_KEY *pkey, int *addrtype)
+{
+	BIGNUM bnpriv;
+	unsigned char ecpriv[48];
+	int res;
+
+	res = vg_b58_decode_check(b58encoded, ecpriv, sizeof(ecpriv));
+	if (res != 34)
+		return 0;
+
+	BN_init(&bnpriv);
+	BN_bin2bn(ecpriv + 1, res - 2, &bnpriv);
+	res = vg_set_privkey(&bnpriv, pkey);
+	BN_clear_free(&bnpriv);
+	*addrtype = ecpriv[0];
+	return 1;
+}
+#if OPENSSL_VERSION_NUMBER < 0x10000000L
+/* The generic PBKDF2 function first appeared in OpenSSL 1.0 */
+/* ====================================================================
+ * Copyright (c) 1999-2006 The OpenSSL Project.  All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer. 
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ *
+ * 3. All advertising materials mentioning features or use of this
+ *    software must display the following acknowledgment:
+ *    "This product includes software developed by the OpenSSL Project
+ *    for use in the OpenSSL Toolkit. (http://www.OpenSSL.org/)"
+ *
+ * 4. The names "OpenSSL Toolkit" and "OpenSSL Project" must not be used to
+ *    endorse or promote products derived from this software without
+ *    prior written permission. For written permission, please contact
+ *    licensing@OpenSSL.org.
+ *
+ * 5. Products derived from this software may not be called "OpenSSL"
+ *    nor may "OpenSSL" appear in their names without prior written
+ *    permission of the OpenSSL Project.
+ *
+ * 6. Redistributions of any form whatsoever must retain the following
+ *    acknowledgment:
+ *    "This product includes software developed by the OpenSSL Project
+ *    for use in the OpenSSL Toolkit (http://www.OpenSSL.org/)"
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE OpenSSL PROJECT ``AS IS'' AND ANY
+ * EXPRESSED OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE OpenSSL PROJECT OR
+ * ITS CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT,
+ * STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED
+ * OF THE POSSIBILITY OF SUCH DAMAGE.
+ * ====================================================================
+ *
+ * This product includes cryptographic software written by Eric Young
+ * (eay@cryptsoft.com).  This product includes software written by Tim
+ * Hudson (tjh@cryptsoft.com).
+ *
+ */
+int
+PKCS5_PBKDF2_HMAC(const char *pass, int passlen,
+		  const unsigned char *salt, int saltlen, int iter,
+		  const EVP_MD *digest,
+		  int keylen, unsigned char *out)
+{
+	unsigned char digtmp[EVP_MAX_MD_SIZE], *p, itmp[4];
+	int cplen, j, k, tkeylen, mdlen;
+	unsigned long i = 1;
+	HMAC_CTX hctx;
+
+	mdlen = EVP_MD_size(digest);
+	if (mdlen < 0)
+		return 0;
+
+	HMAC_CTX_init(&hctx);
+	p = out;
+	tkeylen = keylen;
+	if(!pass)
+		passlen = 0;
+	else if(passlen == -1)
+		passlen = strlen(pass);
+	while(tkeylen)
+		{
+		if(tkeylen > mdlen)
+			cplen = mdlen;
+		else
+			cplen = tkeylen;
+		/* We are unlikely to ever use more than 256 blocks (5120 bits!)
+		 * but just in case...
+		 */
+		itmp[0] = (unsigned char)((i >> 24) & 0xff);
+		itmp[1] = (unsigned char)((i >> 16) & 0xff);
+		itmp[2] = (unsigned char)((i >> 8) & 0xff);
+		itmp[3] = (unsigned char)(i & 0xff);
+		HMAC_Init_ex(&hctx, pass, passlen, digest, NULL);
+		HMAC_Update(&hctx, salt, saltlen);
+		HMAC_Update(&hctx, itmp, 4);
+		HMAC_Final(&hctx, digtmp, NULL);
+		memcpy(p, digtmp, cplen);
+		for(j = 1; j < iter; j++)
+			{
+			HMAC(digest, pass, passlen,
+				 digtmp, mdlen, digtmp, NULL);
+			for(k = 0; k < cplen; k++)
+				p[k] ^= digtmp[k];
+			}
+		tkeylen-= cplen;
+		i++;
+		p+= cplen;
+		}
+	HMAC_CTX_cleanup(&hctx);
+	return 1;
+}
+#endif  /* OPENSSL_VERSION_NUMBER < 0x10000000L */
+
+
+typedef struct {
+	int mode;
+	int iterations;
+	const EVP_MD *(*pbkdf_hash_getter)(void);
+	const EVP_CIPHER *(*cipher_getter)(void);
+} vg_protkey_parameters_t;
+
+static const vg_protkey_parameters_t protkey_parameters[] = {
+	{ 0, 4096,  EVP_sha256, EVP_aes_256_cbc },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 0, 0, NULL, NULL },
+	{ 1, 4096,  EVP_sha256, EVP_aes_256_cbc },
+};
 
 static int
-vg_protect_setup(EVP_CIPHER_CTX *ctx, unsigned char *hmac_out,
-		 const char *pass, const unsigned char *salt, int enc)
+vg_protect_crypt(int parameter_group,
+		 unsigned char *data_in, int data_in_len,
+		 unsigned char *data_out,
+		 const char *pass, int enc)
 {
+	EVP_CIPHER_CTX *ctx = NULL;
+	unsigned char *salt;
 	unsigned char keymaterial[EVP_MAX_KEY_LENGTH + EVP_MAX_IV_LENGTH + 
-				  VG_PROTKEY_HMAC_KEY_SIZE];
+				  EVP_MAX_MD_SIZE];
+	unsigned char hmac[EVP_MAX_MD_SIZE];
+	int hmac_len = 0, hmac_keylen = 0;
+	int salt_len;
+	int plaintext_len = 32;
+	int ciphertext_len;
+	int pkcs7_padding = 1;
+	const vg_protkey_parameters_t *params;
 	const EVP_CIPHER *cipher;
+	const EVP_MD *pbkdf_digest;
+	const EVP_MD *hmac_digest;
+	unsigned int hlen;
+	int opos, olen, oincr, nbytes;
+	int ipos;
+	int ret = 0;
 
-	cipher = EVP_aes_256_cbc();
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		goto out;
+
+	if (parameter_group < 0) {
+		if (enc)
+			parameter_group = 0;
+		else
+			parameter_group = data_in[0];
+	} else {
+		if (!enc && (parameter_group != data_in[0]))
+			goto out;
+	}
+
+	if (parameter_group > (sizeof(protkey_parameters) / 
+			       sizeof(protkey_parameters[0])))
+		goto out;
+	params = &protkey_parameters[parameter_group];
+
+	if (!params->iterations || !params->pbkdf_hash_getter)
+		goto out;
+
+	pbkdf_digest = params->pbkdf_hash_getter();
+	cipher = params->cipher_getter();
+
+	if (params->mode == 0) {
+		/* Brief encoding */
+		salt_len = 4;
+		hmac_len = 8;
+		hmac_keylen = 16;
+		ciphertext_len = ((plaintext_len + cipher->block_size - 1) /
+				  cipher->block_size) * cipher->block_size;
+		pkcs7_padding = 0;
+		hmac_digest = EVP_sha256();
+	} else {
+		/* PKCS-compliant encoding */
+		salt_len = 8;
+		ciphertext_len = ((plaintext_len + cipher->block_size) /
+				  cipher->block_size) * cipher->block_size;
+		hmac_digest = NULL;
+	}
+
+	if (!enc && (data_in_len != (1 + ciphertext_len + hmac_len + salt_len)))
+		goto out;
+
+	if (!pass || !data_out) {
+		/* Format check mode */
+		ret = plaintext_len;
+		goto out;
+	}
+
+	if (!enc) {
+		salt = data_in + 1 + ciphertext_len + hmac_len;
+	} else if (salt_len) {
+		salt = data_out + 1 + ciphertext_len + hmac_len;
+		RAND_bytes(salt, salt_len);
+	} else {
+		salt = NULL;
+	}
 
 	PKCS5_PBKDF2_HMAC((const char *) pass, strlen(pass) + 1,
-			  salt, VG_PROTKEY_SALT_SIZE,
-			  4096,
-			  EVP_sha256(),
-			  cipher->key_len + cipher->iv_len +
-			  VG_PROTKEY_HMAC_KEY_SIZE,
+			  salt, salt_len,
+			  params->iterations,
+			  pbkdf_digest,
+			  cipher->key_len + cipher->iv_len + hmac_keylen,
 			  keymaterial);
 
 	if (!EVP_CipherInit(ctx, cipher,
 			    keymaterial,
 			    keymaterial + cipher->key_len,
 			    enc)) {
-		OPENSSL_cleanse(keymaterial, sizeof(keymaterial));
-		printf("ERROR: could not configure cipher\n");
-		return 0;
+		fprintf(stderr, "ERROR: could not configure cipher\n");
+		goto out;
 	}
 
-	EVP_CIPHER_CTX_set_padding(ctx, 0);
+	if (!pkcs7_padding)
+		EVP_CIPHER_CTX_set_padding(ctx, 0);
 
-	memcpy(hmac_out,
-	       keymaterial + cipher->key_len + cipher->iv_len, 
-	       VG_PROTKEY_HMAC_KEY_SIZE);
+	if (!enc) {
+		opos = 0;
+		olen = plaintext_len;
+		nbytes = ciphertext_len;
+		ipos = 1;
+	} else {
+		data_out[0] = parameter_group;
+		opos = 1;
+		olen = 1 + ciphertext_len + hmac_len + salt_len - opos;
+		nbytes = plaintext_len;
+		ipos = 0;
+	}
 
+	oincr = olen;
+	if (!EVP_CipherUpdate(ctx, data_out + opos, &oincr,
+			      data_in + ipos, nbytes))
+		goto invalid_pass;
+	opos += oincr;
+	olen -= oincr;
+	oincr = olen;
+	if (!EVP_CipherFinal(ctx, data_out + opos, &oincr))
+		goto invalid_pass;
+	opos += oincr;
+
+	if (hmac_len) {
+		hlen = sizeof(hmac);
+		HMAC(hmac_digest,
+		     keymaterial + cipher->key_len + cipher->iv_len,
+		     hmac_keylen,
+		     enc ? data_in : data_out, plaintext_len,
+		     hmac, &hlen);
+		if (enc) {
+			memcpy(data_out + 1 + ciphertext_len, hmac, hmac_len);
+		} else if (memcmp(hmac,
+				  data_in + 1 + ciphertext_len,
+				  hmac_len))
+			goto invalid_pass;
+	}
+
+	if (enc) {
+		if (opos != (1 + ciphertext_len)) {
+			fprintf(stderr, "ERROR: plaintext size mismatch\n");
+			goto out;
+		}
+		opos += hmac_len + salt_len;
+	} else if (opos != plaintext_len) {
+		fprintf(stderr, "ERROR: plaintext size mismatch\n");
+		goto out;
+	}
+
+	ret = opos;
+
+	if (0) {
+	invalid_pass:
+		fprintf(stderr, "ERROR: Invalid password\n");
+	}
+
+out:
+	OPENSSL_cleanse(hmac, sizeof(hmac));
 	OPENSSL_cleanse(keymaterial, sizeof(keymaterial));
-	return 1;
+	if (ctx)
+		EVP_CIPHER_CTX_free(ctx);
+	return ret;
 }
 
 int
 vg_protect_encode_privkey(char *out,
 			  const EC_KEY *pkey, int keytype,
+			  int parameter_group,
 			  const char *pass)
 {
 	unsigned char ecpriv[64];
-	unsigned char ecenc[64];
-	unsigned char hmac[EVP_MAX_MD_SIZE];
-	unsigned char salt[VG_PROTKEY_SALT_SIZE];
-	unsigned char hmac_key[VG_PROTKEY_HMAC_KEY_SIZE];
+	unsigned char ecenc[128];
 	const BIGNUM *privkey;
-	EVP_CIPHER_CTX *ctx = NULL;
-	unsigned int hlen;
-	int opos, olen, oincr, nbytes;
+	int nbytes;
+	int restype;
+
+	restype = (keytype & 1) ? 79 : 32;
 
 	privkey = EC_KEY_get0_private_key(pkey);
 	nbytes = BN_num_bytes(privkey);
@@ -350,54 +767,17 @@ vg_protect_encode_privkey(char *out,
 		memset(ecpriv, 0, 32 - nbytes);
 	BN_bn2bin(privkey, ecpriv + 32 - nbytes);
 
-	ctx = EVP_CIPHER_CTX_new();
-
-	/*
-	 * The string representation of this protected key is
-	 * ridiculously long.  To save a few bytes, we will only
-	 * add four unique random bytes to the salt, out of the
-	 * eight mandated by PBKDF.  This should not reduce its
-	 * effectiveness.
-	 */
-	RAND_bytes(salt, VG_PROTKEY_SALT_SIZE);
-
-	if (!vg_protect_setup(ctx, hmac_key, pass, salt, 1)) {
-		EVP_CIPHER_CTX_free(ctx);
+	nbytes = vg_protect_crypt(parameter_group,
+				  ecpriv, 32,
+				  &ecenc[1], pass, 1);
+	if (nbytes <= 0)
 		return 0;
-	}
 
-	hlen = sizeof(hmac);
-	HMAC(EVP_sha256(),
-	     hmac_key, VG_PROTKEY_HMAC_KEY_SIZE,
-	     ecpriv, 32,
-	     hmac, &hlen);
+	OPENSSL_cleanse(ecpriv, sizeof(ecpriv));
 
-	OPENSSL_cleanse(hmac_key, sizeof(hmac_key));
-
-	ecenc[0] = 136;
-	opos = 1;
-	olen = sizeof(ecenc) - opos;
-
-	oincr = olen;
-	EVP_EncryptUpdate(ctx, ecenc + opos, &oincr, ecpriv, 32);
-	opos += oincr;
-	olen -= oincr;
-
-	oincr = olen;
-	EVP_EncryptFinal(ctx, ecenc + opos, &oincr);
-	opos += oincr;
-
-	EVP_CIPHER_CTX_free(ctx);
-
-	memcpy(ecenc + opos, hmac, VG_PROTKEY_HMAC_SIZE);
-	opos += VG_PROTKEY_HMAC_SIZE;
-
-	memcpy(ecenc + opos, salt, VG_PROTKEY_SALT_SIZE);
-	opos += VG_PROTKEY_SALT_SIZE;
-
-	vg_b58_encode_check(ecenc, opos, out);
+	ecenc[0] = restype;
+	vg_b58_encode_check(ecenc, nbytes + 1, out);
 	nbytes = strlen(out);
-	assert(nbytes == 67);
 	return nbytes;
 }
 
@@ -407,73 +787,196 @@ vg_protect_decode_privkey(EC_KEY *pkey, int *keytype,
 			  const char *encoded, const char *pass)
 {
 	unsigned char ecpriv[64];
-	unsigned char ecenc[64];
-	unsigned char hmac[EVP_MAX_MD_SIZE];
-	unsigned char salt[VG_PROTKEY_SALT_SIZE];
-	unsigned char hmac_key[VG_PROTKEY_HMAC_KEY_SIZE];
-	EVP_CIPHER_CTX *ctx = NULL;
+	unsigned char ecenc[128];
 	BIGNUM bn;
-	unsigned int hlen;
-	int opos, olen, oincr;
+	int restype;
 	int res;
 
 	res = vg_b58_decode_check(encoded, ecenc, sizeof(ecenc));
-	if (res != 45)
+
+	if ((res < 2) || (res > sizeof(ecenc)))
 		return 0;
 
-	memcpy(salt, ecenc + 41, VG_PROTKEY_SALT_SIZE);
-
-	ctx = EVP_CIPHER_CTX_new();
-
-	if (!vg_protect_setup(ctx, hmac_key, pass, salt, 0)) {
-		EVP_CIPHER_CTX_free(ctx);
+	switch (ecenc[0]) {
+	case 32:  restype = 128; break;
+	case 79:  restype = 239; break;
+	default:
 		return 0;
 	}
 
-	opos = 0;
-	olen = sizeof(ecenc) - opos;
-	oincr = olen;
-	EVP_DecryptUpdate(ctx, ecpriv + opos, &oincr, ecenc + 1, 32);
-	opos += oincr;
-	olen -= oincr;
+	if (!vg_protect_crypt(-1,
+			      ecenc + 1, res - 1,
+			      pkey ? ecpriv : NULL,
+			      pass, 0))
+		return 0;
 
-	oincr = olen;
-	EVP_DecryptFinal(ctx, ecpriv + opos, &oincr);
-	opos += oincr;
-
-	EVP_CIPHER_CTX_free(ctx);
-
-	hlen = sizeof(hmac);
-	HMAC(EVP_sha256(),
-	     hmac_key, VG_PROTKEY_HMAC_KEY_SIZE,
-	     ecpriv, 32,
-	     hmac, &hlen);
-
-	if (memcmp(ecenc + 33, hmac, VG_PROTKEY_HMAC_SIZE)) {
+	res = 1;
+	if (pkey) {
+		BN_init(&bn);
+		BN_bin2bn(ecpriv, 32, &bn);
+		res = vg_set_privkey(&bn, pkey);
+		BN_clear_free(&bn);
 		OPENSSL_cleanse(ecpriv, sizeof(ecpriv));
-		printf("ERROR: invalid password\n");
-		return 0;
 	}
 
-	BN_init(&bn);
-	BN_bin2bn(ecpriv, 32, &bn);
-	res = vg_set_privkey(&bn, pkey);
-	BN_clear_free(&bn);
-	OPENSSL_cleanse(ecpriv, sizeof(ecpriv));
+	*keytype = restype;
+	return res;
+}
 
-	if (res) {
-		switch(ecenc[0]) {
-		case 136:
-			*keytype = 128;
-			break;
-		default:
-			printf("Unrecognized private key type\n");
-			res = 0;
-			break;
-		}
+/*
+ * Besides the bitcoin-adapted formats, we also support PKCS#8.
+ */
+int
+vg_pkcs8_encode_privkey(char *out, int outlen,
+			const EC_KEY *pkey, const char *pass)
+{
+	EC_KEY *pkey_copy = NULL;
+	EVP_PKEY *evp_key = NULL;
+	PKCS8_PRIV_KEY_INFO *pkcs8 = NULL;
+	X509_SIG *pkcs8_enc = NULL;
+	BUF_MEM *memptr;
+	BIO *bio = NULL;
+	int res = 0;
+
+	pkey_copy = EC_KEY_dup(pkey);
+	if (!pkey_copy)
+		goto out;
+	evp_key = EVP_PKEY_new();
+	if (!evp_key || !EVP_PKEY_set1_EC_KEY(evp_key, pkey_copy))
+		goto out;
+	pkcs8 = EVP_PKEY2PKCS8(evp_key);
+	if (!pkcs8)
+		goto out;
+
+	bio = BIO_new(BIO_s_mem());
+	if (!bio)
+		goto out;
+
+	if (!pass) {
+		res = PEM_write_bio_PKCS8_PRIV_KEY_INFO(bio, pkcs8);
+
+	} else {
+		pkcs8_enc = PKCS8_encrypt(-1,
+					  EVP_aes_256_cbc(),
+					  pass, strlen(pass),
+					  NULL, 0,
+					  4096,
+					  pkcs8);
+		if (!pkcs8_enc)
+			goto out;
+		res = PEM_write_bio_PKCS8(bio, pkcs8_enc);
+	}
+
+	BIO_get_mem_ptr(bio, &memptr);
+	res = memptr->length;
+	if (res < outlen) {
+		memcpy(out, memptr->data, res);
+		out[res] = '\0';
+	} else {
+		memcpy(out, memptr->data, outlen - 1);
+		out[outlen-1] = '\0';
+	}
+
+out:
+	if (bio)
+		BIO_free(bio);
+	if (pkey_copy)
+		EC_KEY_free(pkey_copy);
+	if (evp_key)
+		EVP_PKEY_free(evp_key);
+	if (pkcs8)
+		PKCS8_PRIV_KEY_INFO_free(pkcs8);
+	if (pkcs8_enc)
+		X509_SIG_free(pkcs8_enc);
+	return res;
+}
+
+int
+vg_pkcs8_decode_privkey(EC_KEY *pkey, const char *pem_in, const char *pass)
+{
+	EC_KEY *pkey_in = NULL;
+	EC_KEY *test_key = NULL;
+	EVP_PKEY *evp_key = NULL;
+	PKCS8_PRIV_KEY_INFO *pkcs8 = NULL;
+	X509_SIG *pkcs8_enc = NULL;
+	BIO *bio = NULL;
+	int res = 0;
+
+	bio = BIO_new_mem_buf((char *)pem_in, strlen(pem_in));
+	if (!bio)
+		goto out;
+
+	pkcs8_enc = PEM_read_bio_PKCS8(bio, NULL, NULL, NULL);
+	if (pkcs8_enc) {
+		if (!pass)
+			return -1;
+		pkcs8 = PKCS8_decrypt(pkcs8_enc, pass, strlen(pass));
+
+	} else {
+		(void) BIO_reset(bio);
+		pkcs8 = PEM_read_bio_PKCS8_PRIV_KEY_INFO(bio, NULL, NULL, NULL);
+	}
+
+	if (!pkcs8)
+		goto out;
+	evp_key = EVP_PKCS82PKEY(pkcs8);
+	if (!evp_key)
+		goto out;
+	pkey_in = EVP_PKEY_get1_EC_KEY(evp_key);
+	if (!pkey_in)
+		goto out;
+
+	/* Expect a specific curve */
+	test_key = EC_KEY_new_by_curve_name(NID_secp256k1);
+	if (!test_key ||
+	    EC_GROUP_cmp(EC_KEY_get0_group(pkey_in),
+			 EC_KEY_get0_group(test_key),
+			 NULL))
+		goto out;
+
+	if (!EC_KEY_copy(pkey, pkey_in))
+		goto out;
+
+	res = 1;
+
+out:
+	if (bio)
+		BIO_free(bio);
+	if (test_key)
+		EC_KEY_free(pkey_in);
+	if (evp_key)
+		EVP_PKEY_free(evp_key);
+	if (pkcs8)
+		PKCS8_PRIV_KEY_INFO_free(pkcs8);
+	if (pkcs8_enc)
+		X509_SIG_free(pkcs8_enc);
+	return res;
+}
+
+
+int
+vg_decode_privkey_any(EC_KEY *pkey, int *addrtype, const char *input,
+		      const char *pass)
+{
+	int res;
+
+	if (vg_decode_privkey(input, pkey, addrtype))
+		return 1;
+	if (vg_decode_privkey_compressed(input, pkey, addrtype))
+		return 1;
+	if (vg_protect_decode_privkey(pkey, addrtype, input, NULL)) {
+		if (!pass)
+			return -1;
+		return vg_protect_decode_privkey(pkey, addrtype, input, pass);
+	}
+	res = vg_pkcs8_decode_privkey(pkey, input, pass);
+	if (res > 0) {
+		/* Assume main network address */
+		*addrtype = 128;
 	}
 	return res;
 }
+
 
 int
 vg_read_password(char *buf, size_t size)
@@ -566,28 +1069,34 @@ vg_check_password_complexity(const char *pass, int verbose)
 	/* Complain by default about weak passwords */
 	if ((weak && (verbose > 0)) || (verbose > 1)) {
 		if (cracktime < 1.0) {
-			printf("Estimated password crack time: >1 %s\n",
+			fprintf(stderr,
+				"Estimated password crack time: >1 %s\n",
 			       crackunit);
 		} else if (cracktime < 1000000) {
-			printf("Estimated password crack time: %.1f %s\n",
-			       cracktime, crackunit);
+			fprintf(stderr,
+				"Estimated password crack time: %.1f %s\n",
+				cracktime, crackunit);
 		} else {
-			printf("Estimated password crack time: %e %s\n",
-			       cracktime, crackunit);
+			fprintf(stderr,
+				"Estimated password crack time: %e %s\n",
+				cracktime, crackunit);
 		}
 		if (!classes[0] && !classes[1] && classes[2] &&
 		    !classes[3] && !classes[4] && !classes[5]) {
-			printf("WARNING: Password contains only numbers\n");
+			fprintf(stderr,
+				"WARNING: Password contains only numbers\n");
 		}
 		else if (!classes[2] && !classes[3] && !classes[4] &&
 			 !classes[5]) {
 			if (!classes[0] || !classes[1]) {
-				printf("WARNING: Password contains "
-				       "only %scase letters\n",
-				       classes[0] ? "lower" : "upper");
+				fprintf(stderr,
+					"WARNING: Password contains "
+					"only %scase letters\n",
+					classes[0] ? "lower" : "upper");
 			} else {
-				printf("WARNING: Password contains "
-				       "only letters\n");
+				fprintf(stderr,
+					"WARNING: Password contains "
+					"only letters\n");
 			}
 		}
 	}
@@ -630,7 +1139,8 @@ vg_read_file(FILE *fp, char ***result, int *rescount)
 		pos = count - pos;
 		count = fread(&buf[pos], 1, blksize - pos, fp);
 		if (count < 0) {
-			printf("Error reading file: %s\n", strerror(errno));
+			fprintf(stderr,
+				"Error reading file: %s\n", strerror(errno));
 			ret = 0;
 		}
 		if (count <= 0)
